@@ -1,0 +1,56 @@
+diff --git a/ggml/src/ggml-cuda/argsort.cu b/ggml/src/ggml-cuda/argsort.cu
+index 24115da..e4b6afb 100644
+--- a/ggml/src/ggml-cuda/argsort.cu
++++ b/ggml/src/ggml-cuda/argsort.cu
+@@ -167,7 +167,13 @@ static inline __device__ void ggml_cuda_swap(T & a, T & b) {
+ }
+ 
+ template<ggml_sort_order order>
+-static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int ncols, int ncols_pad) {
++// gfx928 (Hygon DCU / DTK clang) infers .max_flat_workgroup_size = 256 for this kernel when no
++// launch bound is given, while argsort_f32_i32_cuda_bitonic launches one thread per ncols_pad
++// element. Any ncols in (256, 1024] then fails at launch with
++//   "Launch params (N, 1, 1) are larger than launch bounds (256)"
++// which is reachable from ggml_top_k() -> ggml_cuda_op_top_k() -> top-k.cu, i.e. from the
++// qwen4exp lightning indexer (src/models/qwen4exp.cpp). Declare the real bound.
++static __global__ void __launch_bounds__(1024) k_argsort_f32_i32(const float * x, int * dst, const int ncols, int ncols_pad) {
+     // bitonic sort
+     int col = threadIdx.x;
+     int row = blockIdx.x;
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index b13b34e..90b9b0d 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -389,5 +389,32 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
+         return n_experts > 0;
+     }
+ 
++    // Hygon DCU (gfx926/928/936/938, e.g. K100_AI) is classified as CDNA2 but has no usable
++    // MFMA (see HYGON_DCU_NO_MFMA), so the amd_mfma_available() branch above is skipped and
++    // amd_wmma_available() is false too. That leaves the CDNA2 dense heuristic below, which
++    // is wrong for the MoE case:
++    //
++    //   * MoE (n_experts > 0): without MMQ, ggml_cuda_mul_mat_id() has no device-side
++    //     alternative -- ggml_cuda_should_use_mmf() rejects quantized types outright
++    //     (mmf.cu), so it falls into the hipBLAS host fallback, which syncs the stream
++    //     twice and launches one GEMM per expert. That fallback cannot be captured in a
++    //     CUDA graph and is why every prefill MoE matmul (ne11 = ubatch >= 64) was slow.
++    //     MMQ is a device-side grouped GEMM (mmid.cu) and is graph-able, so it is a clear
++    //     win here.
++    //
++    //   * dense (n_experts == 0): the line below keeps the upstream heuristic, and that is
++    //     the measured-correct choice -- do NOT force MMQ for dense on this part. Even
++    //     without MFMA the dequant + hipBLAS f16 route beats dp4a MMQ once the batch is
++    //     large enough to amortize the dequant, and MMQ costs ~8% end-to-end if forced.
++    if (GGML_CUDA_CC_IS_HYGON_DCU(cc)) {
++        // Measured on K100_AI (gfx928), ub=2048, ~4850-token prompt, llama-server
++        // prompt-eval ms/token, A/B over two rebuilds of this one line:
++        //   return n_experts > 0  -> 3.05 ms/tok
++        //   return true           -> 3.30 ms/tok  (-7.6%)
++        // i.e. keeping MMQ for MoE is a clear win, but forcing it for dense matmuls is a
++        // loss. test-backend-ops: MUL_MAT 1297/1297, MUL_MAT_ID 929/929 with this.
++        return n_experts > 0;
++    }
++
+     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+ }

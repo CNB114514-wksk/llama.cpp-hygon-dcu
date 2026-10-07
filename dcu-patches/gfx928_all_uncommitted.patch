@@ -1,0 +1,352 @@
+diff --git a/ggml/src/ggml-cuda/argsort.cu b/ggml/src/ggml-cuda/argsort.cu
+index 24115da..e4b6afb 100644
+--- a/ggml/src/ggml-cuda/argsort.cu
++++ b/ggml/src/ggml-cuda/argsort.cu
+@@ -167,7 +167,13 @@ static inline __device__ void ggml_cuda_swap(T & a, T & b) {
+ }
+ 
+ template<ggml_sort_order order>
+-static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int ncols, int ncols_pad) {
++// gfx928 (Hygon DCU / DTK clang) infers .max_flat_workgroup_size = 256 for this kernel when no
++// launch bound is given, while argsort_f32_i32_cuda_bitonic launches one thread per ncols_pad
++// element. Any ncols in (256, 1024] then fails at launch with
++//   "Launch params (N, 1, 1) are larger than launch bounds (256)"
++// which is reachable from ggml_top_k() -> ggml_cuda_op_top_k() -> top-k.cu, i.e. from the
++// qwen4exp lightning indexer (src/models/qwen4exp.cpp). Declare the real bound.
++static __global__ void __launch_bounds__(1024) k_argsort_f32_i32(const float * x, int * dst, const int ncols, int ncols_pad) {
+     // bitonic sort
+     int col = threadIdx.x;
+     int row = blockIdx.x;
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 2e78ae4..cc5e142 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -83,6 +83,17 @@
+ #define GGML_CUDA_CC_RDNA3_5    (GGML_CUDA_CC_OFFSET_AMD + 0x1150) // AI 370, AI Max 395 laptops.
+ #define GGML_CUDA_CC_RDNA4      (GGML_CUDA_CC_OFFSET_AMD + 0x1200) // RX 9000
+ 
++// Hygon DCU (K100/K500 series). These ids fall into the CDNA2 cc range so the host uses the CDNA
++// config tables, but the DTK toolchain does not enable the mai-insts target feature for them,
++// i.e. no MFMA is available. Must be kept in sync with HYGON_DCU_NO_MFMA in vendors/hip.h.
++#define GGML_CUDA_CC_HYGON_GFX926 (GGML_CUDA_CC_OFFSET_AMD + 0x926)
++#define GGML_CUDA_CC_HYGON_GFX928 (GGML_CUDA_CC_OFFSET_AMD + 0x928) // K100_AI, K500SM_AI
++#define GGML_CUDA_CC_HYGON_GFX936 (GGML_CUDA_CC_OFFSET_AMD + 0x936)
++#define GGML_CUDA_CC_HYGON_GFX938 (GGML_CUDA_CC_OFFSET_AMD + 0x938)
++
++#define GGML_CUDA_CC_IS_HYGON_DCU(cc) ((cc) == GGML_CUDA_CC_HYGON_GFX926 || (cc) == GGML_CUDA_CC_HYGON_GFX928 || \
++                                       (cc) == GGML_CUDA_CC_HYGON_GFX936 || (cc) == GGML_CUDA_CC_HYGON_GFX938)
++
+ #define GGML_CUDA_CC_IS_AMD(cc)     (cc >= GGML_CUDA_CC_OFFSET_AMD)
+ #define GGML_CUDA_CC_IS_RDNA(cc)    (cc >= GGML_CUDA_CC_RDNA1)
+ #define GGML_CUDA_CC_IS_RDNA1(cc)   (cc >= GGML_CUDA_CC_RDNA1 && cc < GGML_CUDA_CC_RDNA2)
+@@ -272,9 +283,9 @@ static const char * cu_get_error_str(CUresult err) {
+ #define FAST_FP16_AVAILABLE
+ #endif // defined(FP16_AVAILABLE) && __CUDA_ARCH__ != 610
+ 
+-#if defined(GGML_USE_HIP) && defined(CDNA) && !defined(GGML_HIP_NO_MMQ_MFMA)
++#if defined(GGML_USE_HIP) && defined(CDNA) && !defined(GGML_HIP_NO_MMQ_MFMA) && !defined(HYGON_DCU_NO_MFMA)
+ #define AMD_MFMA_AVAILABLE
+-#endif // defined(GGML_USE_HIP) && defined(CDNA) && !defined(GGML_HIP_NO_MMQ_MFMA)
++#endif // defined(GGML_USE_HIP) && defined(CDNA) && !defined(GGML_HIP_NO_MMQ_MFMA) && !defined(HYGON_DCU_NO_MFMA)
+ 
+ #if defined(GGML_USE_HIP) && (defined(RDNA4) || defined(RDNA3))
+ #define AMD_WMMA_AVAILABLE
+@@ -347,7 +358,8 @@ static bool fp32_mma_hardware_available(const int cc) {
+ 
+ static bool amd_mfma_available(const int cc) {
+ #if !defined(GGML_HIP_NO_MMQ_MFMA)
+-    return GGML_CUDA_CC_IS_CDNA(cc);
++    // Hygon DCU is classified as CDNA2 but has no usable MFMA, see HYGON_DCU_NO_MFMA in vendors/hip.h.
++    return GGML_CUDA_CC_IS_CDNA(cc) && !GGML_CUDA_CC_IS_HYGON_DCU(cc);
+ #else
+     return false;
+ #endif //!defined(GGML_HIP_NO_MMQ_MFMA)
+diff --git a/ggml/src/ggml-cuda/mean.cu b/ggml/src/ggml-cuda/mean.cu
+index 64ad7e1..8557691 100644
+--- a/ggml/src/ggml-cuda/mean.cu
++++ b/ggml/src/ggml-cuda/mean.cu
+@@ -67,7 +67,7 @@ void ggml_cuda_op_mean(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     // See discussion in: https://github.com/ggml-org/llama.cpp/pull/15132
+     dim3 block_dims;
+     if ((nrows / nsm) < 2) {
+-        block_dims = dim3(512, 1, 1);
++        block_dims = dim3(256, 1, 1);
+     } else {
+         block_dims = dim3(ncols < 1024 ? 32 : 128, 1, 1);
+     }
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index b13b34e..90b9b0d 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -389,5 +389,32 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
+         return n_experts > 0;
+     }
+ 
++    // Hygon DCU (gfx926/928/936/938, e.g. K100_AI) is classified as CDNA2 but has no usable
++    // MFMA (see HYGON_DCU_NO_MFMA), so the amd_mfma_available() branch above is skipped and
++    // amd_wmma_available() is false too. That leaves the CDNA2 dense heuristic below, which
++    // is wrong for the MoE case:
++    //
++    //   * MoE (n_experts > 0): without MMQ, ggml_cuda_mul_mat_id() has no device-side
++    //     alternative -- ggml_cuda_should_use_mmf() rejects quantized types outright
++    //     (mmf.cu), so it falls into the hipBLAS host fallback, which syncs the stream
++    //     twice and launches one GEMM per expert. That fallback cannot be captured in a
++    //     CUDA graph and is why every prefill MoE matmul (ne11 = ubatch >= 64) was slow.
++    //     MMQ is a device-side grouped GEMM (mmid.cu) and is graph-able, so it is a clear
++    //     win here.
++    //
++    //   * dense (n_experts == 0): the line below keeps the upstream heuristic, and that is
++    //     the measured-correct choice -- do NOT force MMQ for dense on this part. Even
++    //     without MFMA the dequant + hipBLAS f16 route beats dp4a MMQ once the batch is
++    //     large enough to amortize the dequant, and MMQ costs ~8% end-to-end if forced.
++    if (GGML_CUDA_CC_IS_HYGON_DCU(cc)) {
++        // Measured on K100_AI (gfx928), ub=2048, ~4850-token prompt, llama-server
++        // prompt-eval ms/token, A/B over two rebuilds of this one line:
++        //   return n_experts > 0  -> 3.05 ms/tok
++        //   return true           -> 3.30 ms/tok  (-7.6%)
++        // i.e. keeping MMQ for MoE is a clear win, but forcing it for dense matmuls is a
++        // loss. test-backend-ops: MUL_MAT 1297/1297, MUL_MAT_ID 929/929 with this.
++        return n_experts > 0;
++    }
++
+     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+ }
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index c3758cd..e7b31a7 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -1,3 +1,8 @@
++
++#ifndef GGML_CUDA_MAX_THREADS_PER_BLOCK
++#define GGML_CUDA_MAX_THREADS_PER_BLOCK 256
++#endif
++
+ #include "norm.cuh"
+ #include <cstdint>
+ 
+@@ -178,7 +183,7 @@ static __global__ void rms_norm_back_f32(
+     sum_xx = warp_reduce_sum(sum_xx);
+     sum_xg = warp_reduce_sum(sum_xg);
+     if constexpr (block_size > WARP_SIZE) {
+-        static_assert(block_size == 1024, "unexpected block_size");
++        static_assert(block_size == 256, "unexpected block_size");
+         __shared__ float s_sum_xx[32];
+         __shared__ float s_sum_xg[32];
+         const int warp_id = threadIdx.x / WARP_SIZE;
+@@ -281,23 +286,23 @@ static void norm_f32_cuda(
+         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
+     const dim3 blocks_num(nrows, nchannels, nsamples);
+-    if (ncols < 1024) {
++    if (ncols < 256) {
+         const dim3 block_dims(WARP_SIZE, 1, 1);
+         norm_f32<WARP_SIZE><<<blocks_num, block_dims, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+     } else {
+-        const dim3 block_dims(1024, 1, 1);
+-        norm_f32<1024><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
++        const dim3 block_dims(256, 1, 1);
++        norm_f32<256><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+     }
+ }
+ 
+ static void group_norm_f32_cuda(
+         const float * x, float * dst, const int num_groups, const float eps, const int group_size, const int ne_elements, cudaStream_t stream) {
+-    if (group_size < 1024) {
++    if (group_size < 256) {
+         const dim3 block_dims(WARP_SIZE, 1, 1);
+         group_norm_f32<WARP_SIZE><<<num_groups, block_dims, 0, stream>>>(x, dst, group_size, ne_elements, eps);
+     } else {
+-        const dim3 block_dims(1024, 1, 1);
+-        group_norm_f32<1024><<<num_groups, block_dims, block_dims.x > WARP_SIZE ? 2 * 32 * sizeof(float): 0, stream>>>(x, dst, group_size, ne_elements, eps);
++        const dim3 block_dims(256, 1, 1);
++        group_norm_f32<256><<<num_groups, block_dims, block_dims.x > WARP_SIZE ? 2 * 32 * sizeof(float): 0, stream>>>(x, dst, group_size, ne_elements, eps);
+     }
+ }
+ 
+@@ -305,7 +310,7 @@ static void rms_norm_f32_cuda(
+         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
+     const dim3 blocks_num(nrows, nchannels, nsamples);
+-    if (ncols < 1024) {
++    if (ncols < 256) {
+         const dim3 block_dims(256, 1, 1);
+         const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+         ggml_cuda_kernel_launch(rms_norm_f32<256, false>, launch_params,
+@@ -314,9 +319,9 @@ static void rms_norm_f32_cuda(
+         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+     } else {
+-        const dim3 block_dims(1024, 1, 1);
++        const dim3 block_dims(256, 1, 1);
+         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+-        ggml_cuda_kernel_launch(rms_norm_f32<1024, false>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
++        ggml_cuda_kernel_launch(rms_norm_f32<256, false>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+         // underlying cudaLaunchKernelEx does not support default params
+         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+@@ -360,7 +365,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+         const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
+         const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
+         const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+-        if (ncols < 1024) {
++        if (ncols < 256) {
+             const dim3 block_dims(256, 1, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+             ggml_cuda_kernel_launch(rms_norm_f32<256, true>, launch_params,
+@@ -369,9 +374,9 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+                 // underlying cudaLaunchKernelEx does not support default params
+             nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+         } else {
+-            const dim3 block_dims(1024, 1, 1);
++            const dim3 block_dims(256, 1, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+-            ggml_cuda_kernel_launch(rms_norm_f32<1024, true>, launch_params,
++            ggml_cuda_kernel_launch(rms_norm_f32<256, true>, launch_params,
+                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                 // underlying cudaLaunchKernelEx does not support default params
+@@ -387,7 +392,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+         const uint3 add_nrows_packed     = init_fastdiv_values(add_nrows);
+         const uint3 add_nchannels_packed = init_fastdiv_values(add_nchannels);
+         const uint3 add_nsamples_packed  = init_fastdiv_values(add_nsamples);
+-        if (ncols < 1024) {
++        if (ncols < 256) {
+             const dim3 block_dims(256, 1, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims,block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+             ggml_cuda_kernel_launch(rms_norm_f32<256, true, true>, launch_params,
+@@ -396,9 +401,9 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+                 add_nchannels_packed, add_nsamples_packed);
+         } else {
+-            const dim3 block_dims(1024, 1, 1);
++            const dim3 block_dims(256, 1, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+-            ggml_cuda_kernel_launch(rms_norm_f32<1024, true, true>, launch_params,
++            ggml_cuda_kernel_launch(rms_norm_f32<256, true, true>, launch_params,
+                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
+                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+@@ -408,12 +413,12 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+ }
+ 
+ static void rms_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
+-    if (ncols < 1024) {
++    if (ncols < 256) {
+         const dim3 block_dims(WARP_SIZE, 1, 1);
+         rms_norm_back_f32<WARP_SIZE><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
+     } else {
+-        const dim3 block_dims(1024, 1, 1);
+-        rms_norm_back_f32<1024><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
++        const dim3 block_dims(256, 1, 1);
++        rms_norm_back_f32<256><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
+     }
+ }
+ 
+@@ -421,14 +426,14 @@ static void l2_norm_f32_cuda(
+         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
+     const dim3 blocks_num(nrows, nchannels, nsamples);
+-    if (ncols < 1024) {
++    if (ncols < 256) {
+         const dim3 block_dims(WARP_SIZE, 1, 1);
+         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 0, stream};
+         ggml_cuda_kernel_launch(l2_norm_f32<WARP_SIZE>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+     } else {
+-        const dim3 block_dims(1024, 1, 1);
++        const dim3 block_dims(256, 1, 1);
+         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+-        ggml_cuda_kernel_launch(l2_norm_f32<1024>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
++        ggml_cuda_kernel_launch(l2_norm_f32<256>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+     }
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/softmax.cu b/ggml/src/ggml-cuda/softmax.cu
+index f320c6f..8d16a58 100644
+--- a/ggml/src/ggml-cuda/softmax.cu
++++ b/ggml/src/ggml-cuda/softmax.cu
+@@ -339,7 +339,7 @@ static void soft_max_f32_cuda(const float *                                x,
+     const dim3 block_dims(nth,     1, 1);
+     const dim3 block_nums(params.ne01, params.ne02, params.ne03);
+     const size_t nbytes_shared = (GGML_PAD(ncols_x, WARP_SIZE) + WARP_SIZE)*sizeof(float);
+-    static_assert(CUDA_SOFT_MAX_BLOCK_SIZE == 1024, "These values need to be adjusted.");
++    static_assert(CUDA_SOFT_MAX_BLOCK_SIZE == 256, "These values need to be adjusted.");
+ 
+ 
+     const int id       = ggml_cuda_get_device();
+diff --git a/ggml/src/ggml-cuda/softmax.cuh b/ggml/src/ggml-cuda/softmax.cuh
+index 93dfee8..91087c5 100644
+--- a/ggml/src/ggml-cuda/softmax.cuh
++++ b/ggml/src/ggml-cuda/softmax.cuh
+@@ -1,6 +1,6 @@
+ #include "common.cuh"
+ 
+-#define CUDA_SOFT_MAX_BLOCK_SIZE 1024
++#define CUDA_SOFT_MAX_BLOCK_SIZE 256
+ 
+ void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+diff --git a/ggml/src/ggml-cuda/sumrows.cu b/ggml/src/ggml-cuda/sumrows.cu
+index aa8342b..8a6d01d 100644
+--- a/ggml/src/ggml-cuda/sumrows.cu
++++ b/ggml/src/ggml-cuda/sumrows.cu
+@@ -6,7 +6,7 @@ void sum_rows_f32_cuda(const float * x, float * dst, const int ncols, const int
+     const int  nsm = ggml_cuda_info().devices[id].nsm;
+     const dim3 block_nums(nrows, 1, 1);
+     if ((nrows / nsm) < 2) {
+-        const dim3 block_dims(512, 1, 1);
++        const dim3 block_dims(256, 1, 1);
+         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+         ggml_cuda_kernel_launch(reduce_rows_f32</*norm=*/false>, launch_params, x, dst, ncols);
+     } else {
+@@ -40,8 +40,8 @@ void ggml_cuda_op_sum_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int nsm = ggml_cuda_info().devices[id].nsm;
+     dim3 block_dims;
+     if ((nrows / nsm) < 2) {
+-        // Increase num threads to 512 for small nrows to better hide the latency
+-        block_dims = dim3(512, 1, 1);
++        // Increase num threads to 256 for small nrows to better hide the latency
++        block_dims = dim3(256, 1, 1);
+     } else {
+         // Enough active SMs to hide latency, use smaller blocks to allow better scheduling
+         block_dims = dim3(ncols < 1024 ? 32 : 128, 1, 1);
+diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
+index 48d4eb2..3ce5307 100644
+--- a/ggml/src/ggml-cuda/vendors/hip.h
++++ b/ggml/src/ggml-cuda/vendors/hip.h
+@@ -192,6 +192,20 @@
+ #define GCN
+ #endif // defined(GCN5) || defined(GCN4)
+ 
++// Hygon DCU (K100/K500 series): the host side maps these device ids to cc = 0x92x/0x93x
++// and classifies them as CDNA2 (see ggml_cuda_parse_id), but there was no matching macro
++// on the device side, so the kernels fell back to the RDNA2 config tables. Host and
++// device then disagreed on the MMQ/MMVQ tile configuration (e.g. nthreads 512 vs 256),
++// which corrupted the shared memory tiling and produced NaN. Map them to CDNA2 here so
++// that both sides select the same config tables.
++#if defined(__gfx926__) || defined(__gfx928__) || defined(__gfx936__) || defined(__gfx938__)
++#define CDNA2
++// These targets do not have the mai-insts target feature enabled in the DTK toolchain, so MFMA
++// intrinsics cannot be compiled for them: keep AMD_MFMA_AVAILABLE off on the device side.
++// Must be kept in sync with GGML_CUDA_CC_IS_HYGON_DCU() in ../common.cuh.
++#define HYGON_DCU_NO_MFMA
++#endif // defined(__gfx926__) || defined(__gfx928__) || defined(__gfx936__) || defined(__gfx938__)
++
+ #if defined(__gfx950__)
+ #define CDNA4
+ #endif // defined(__gfx950__)
+diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
+index a6a6b72..059ffc2 100644
+--- a/ggml/src/ggml-hip/CMakeLists.txt
++++ b/ggml/src/ggml-hip/CMakeLists.txt
+@@ -51,8 +51,9 @@ if (GGML_HIP_RCCL)
+     find_package(rccl REQUIRED)
+ endif()
+ 
+-if (${hip_VERSION} VERSION_LESS 6.1)
+-    message(FATAL_ERROR "At least ROCM/HIP V6.1 is required")
++# PATCHED for DTK 26.04 (ROCm 5.3-based hip 5.3.26113): relax upstream >=6.1 gate
++if (DEFINED hip_VERSION AND ${hip_VERSION} VERSION_LESS 6.1)
++    message(WARNING "ROCm/HIP ${hip_VERSION} < 6.1 detected; building anyway (DTK 26.04 / ROCm 5.3)")
+ endif()
+ 
+ message(STATUS "HIP and hipBLAS found")
