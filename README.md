@@ -1,11 +1,11 @@
-# llama.cpp · Hygon DCU 移植版（gfx928 / gfx936）
+# llama.cpp · Hygon DCU 移植版（gfx906 / gfx926 / gfx928 / gfx936 / gfx938）
 
 [llama.cpp](https://github.com/ggml-org/llama.cpp) 的**海光 DCU（Hygon DCU）移植版**。
 
 > ✅ **本移植版已可直接运行当前最新的 Qwen3.8-Flash-Next（qwen4exp）模型** —— 48 层、其中 36 层 Gated-Delta-Net（SSM 线性注意力）、512 个 MoE 专家、UD-Q4_K_XL 量化约 104 GiB，已在海光 **K100_AI（gfx928）** 上跑通并完成调优（见下文跑分）。
 
 - 源码基线：上游 `master` @ `26394b4`
-- 目标架构：`gfx926 / gfx928 / gfx936 / gfx938`（`GGML_CUDA_CC_IS_HYGON_DCU` 宏统一覆盖，**同代海光可直接用**）
+- 目标架构：`gfx906 / gfx926 / gfx928 / gfx936 / gfx938`（`GGML_CUDA_CC_IS_HYGON_DCU` 宏统一覆盖，**同代海光可直接用**）
 - 后端：HIP（DTK 26.04 / clang 17）
 - 矩阵核：**MMAC**（`v_mmac_*`），**不是** AMD MFMA
 
@@ -16,7 +16,7 @@
 | **Qwen3.8-Flash-Next / qwen4exp** | 支持这种「SSM + MoE 混合」最新架构，`llama-server` 可正常起 OpenAI 兼容服务 |
 | **Hygon DCU HIP 移植** | `ggml/src/ggml-cuda/vendors/hip.h`、`common.cuh`、`ggml-hip/CMakeLists.txt` 等已适配海光 |
 | **自写 MMAC F16 稠密 GEMM** | `ggml/src/ggml-cuda/mmac-gemm.{cu,cuh}`。gfx928/gfx936 上 MFMA 被屏蔽，但 MMAC 可用（实测 FP16 178.1 / BF16 180.7 TFLOPS、INT8 361.6 TOPS）；接入后 prefill 提升约 **1.32×**（`GGML_CUDA_MMAC_GEMM=0` 可回退对比） |
-| **预编译 fat binary** | `llama.cpp-dcu-bin-gfx928-gfx936.tar.gz` 同时含 gfx928 + gfx936 code object，运行时由 HIP 自动选择 |
+| **预编译 fat binary** | `llama.cpp-dcu-bin-gfx9-all.tar.gz` 同时含 gfx906 / gfx926 / gfx928 / gfx936 / gfx938 五个 code object，运行时由 HIP 自动选择 |
 | **MoE → MMQ + argsort 修复** | 见 `dcu-patches/` |
 
 ## 2. 仓库内容
@@ -29,7 +29,7 @@
 │   ├── template_mmac_delta.patch            # MMAC 增量（4 文件）
 │   ├── gfx928_moe_mmq_and_argsort.patch     # MoE→MMQ + argsort 修复
 │   └── gfx928_all_uncommitted.patch         # gfx928 适配面（hip.h / common.cuh / norm ...）
-├── llama.cpp-dcu-bin-gfx928-gfx936.tar.gz     # ★ 预编译产物（bin/ 目录，gfx928;gfx936 fat）
+├── llama.cpp-dcu-bin-gfx9-all.tar.gz          # ★ 预编译产物（build-gfx9-all/bin/，gfx906;926;928;936;938 fat）
 ├── README-upstream.md          # 上游原始 README
 └── README.md                   # 本文件
 ```
@@ -37,20 +37,21 @@
 ## 3. 使用预编译产物（免编译）
 
 ```sh
-tar xzf llama.cpp-dcu-bin-gfx928-gfx936.tar.gz          # 解出 build-gfx928/bin/
+tar xzf llama.cpp-dcu-bin-gfx9-all.tar.gz               # 解出 build-gfx9-all/bin/
 source /opt/dtk/env.sh
-export LD_LIBRARY_PATH=$PWD/build-gfx928/bin:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$PWD/build-gfx9-all/bin:$LD_LIBRARY_PATH
 
-./build-gfx928/bin/llama-server --help   # OpenAI 兼容服务
-./build-gfx928/bin/llama-cli   --help
+./build-gfx9-all/bin/llama-server --help   # OpenAI 兼容服务
+./build-gfx9-all/bin/llama-cli   --help
 ```
 
-`build-gfx928/bin/` 内含：`llama-server`、`llama-cli`、`llama-bench`、`test-backend-ops`，以及
+`build-gfx9-all/bin/` 内含：`llama-server`、`llama-cli`、`llama-bench`、`test-backend-ops`，以及
 `libggml-hip.so`（含 HIP kernel）、`libllama.so`、`libllama-common.so`、`libmtmd.so` 等运行库。
 
 ## 4. 从源码编译
 
-依赖：海光 DTK（`/opt/dtk`，含 `hipcc` / clang / rocBLAS）。默认编 gfx928 + gfx936 的 fat binary：
+依赖：海光 DTK（`/opt/dtk`，含 `hipcc` / clang / rocBLAS）。预编译包覆盖 gfx906/926/928/936/938 五个架构；
+下面示例以 gfx928 + gfx936 为例，按需改 `-DAMDGPU_TARGETS` / `-DGPU_TARGETS`：
 
 ```sh
 source /opt/dtk/env.sh
