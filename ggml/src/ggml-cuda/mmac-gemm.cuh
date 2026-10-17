@@ -42,3 +42,6 @@
 bool ggml_cuda_mmac_gemm_f16(cudaStream_t stream,
                              const void * act, const void * weight, float * dst,
                              int64_t tokens, int64_t features, int64_t K);
+
+// Runtime availability of the MMAC matrix core on the current device (arch + one-time probe).
+bool ggml_cuda_mmac_available();

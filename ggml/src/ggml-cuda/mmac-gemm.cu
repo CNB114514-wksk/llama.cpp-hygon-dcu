@@ -220,6 +220,11 @@ static bool mmac_available() {
     return cached != 0;
 }
 
+// Exported for the sibling Q4_K MMAC kernels (mmac-gemm-q4k.cu): cheap after the first call.
+bool ggml_cuda_mmac_available() {
+    return mmac_available();
+}
+
 bool ggml_cuda_mmac_gemm_f16(cudaStream_t stream,
                              const void * act, const void * weight, float * dst,
                              int64_t tokens, int64_t features, int64_t K) {

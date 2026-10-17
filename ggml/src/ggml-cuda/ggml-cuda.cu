@@ -29,8 +29,10 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmac-gemm.cuh"
+#include "ggml-cuda/mmac-gemm-q4k.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mmid.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -1880,6 +1882,20 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    // Hygon DCU: route large Q4_K matmuls through the MMAC matrix core, dequantizing the weight
+    // tiles on the fly to f16 in shared memory. Falls back internally (returns false) when the
+    // shape/arch does not fit, in which case MMQ handles it below.
+    if (src0->type == GGML_TYPE_Q4_K && ne11 >= 256 && ne12 == 1 && ne13 == 1 &&
+            src0->ne[2] == 1 && src0->ne[3] == 1 &&
+            src0->nb[0] == ggml_type_size(src0->type) && src0->nb[1] % ggml_type_size(src0->type) == 0 &&
+            src1->nb[0] == sizeof(float) && src1->nb[1] == ne10*sizeof(float) &&
+            dst->nb[0] == sizeof(float) && dst->nb[1] == ne0*sizeof(float) &&
+            ne00 % 256 == 0) {
+        if (ggml_cuda_mmac_gemm_q4_K(ctx.stream(), src1->data, true, src0->data, (float *) dst->data,
+                                     ne11, ne01, ne00, src0->nb[1] / ggml_type_size(src0->type))) {
+            return;
+        }
+    }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
@@ -1895,6 +1911,11 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
+    }
+
+    // [TAG_MUL_MAT_ID_CUDA_GRAPHS] the grouped MMAC path is device-side only, like MMQ.
+    if (dst->src[2] && ggml_cuda_mmac_gemm_q4_K_id_usable(src0, src1, dst->src[2], dst)) {
+        return false;
     }
 
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
@@ -1946,6 +1967,35 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
             }
+        }
+
+        // Hygon DCU: grouped MMAC path for Q4_K expert weights. Rows are sorted by expert with
+        // the same device-side ids helpers the MMQ path uses (no host synchronization).
+        if (ggml_cuda_mmac_gemm_q4_K_id_usable(src0, src1, ids, dst)) {
+            const int64_t n_expert_used_mmac = ids->ne[0];
+            const int64_t ne_get_rows_mmac   = ne12 * n_expert_used_mmac;
+
+            ggml_cuda_pool_alloc<int32_t> ids_src1_mmac(ctx.pool(), ne_get_rows_mmac);
+            ggml_cuda_pool_alloc<int32_t> ids_dst_mmac (ctx.pool(), ne_get_rows_mmac);
+            ggml_cuda_pool_alloc<int32_t> expert_bounds_mmac(ctx.pool(), ne02 + 1);
+
+            const int si1_mmac  = ids->nb[1] / ggml_element_size(ids);
+            const int sis1_mmac = nb12 / nb11;
+
+            ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1_mmac.get(), ids_dst_mmac.get(),
+                expert_bounds_mmac.get(), ne02, ne12, n_expert_used_mmac, ne11, si1_mmac, sis1_mmac,
+                /*write_inverse=*/false, ctx.stream());
+            CUDA_CHECK(cudaGetLastError());
+
+            if (ggml_cuda_mmac_gemm_q4_K_id(ctx.stream(), src1->data, src0->data, (float *) dst->data,
+                        ids_src1_mmac.get(), ids_dst_mmac.get(), expert_bounds_mmac.get(),
+                        ne02, ne_get_rows_mmac, ne01, ne00,
+                        src1->nb[1] / sizeof(float),
+                        src0->nb[1] / ggml_type_size(src0->type),
+                        src0->nb[2] / ggml_type_size(src0->type))) {
+                return;
+            }
+            // kernel refused (e.g. probe unavailable): fall through, MMQ re-runs the ids helper
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
