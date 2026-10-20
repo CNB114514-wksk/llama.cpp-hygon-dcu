@@ -1882,8 +1882,18 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // length of the last drafted n-gram (number of tokens returned by draft)
         size_t n_draft_last = 0;
 
-        // consecutive accept rounds with low acceptance fraction (< 0.5)
-        int n_low = 0;
+        // smoothed acceptance fraction and number of draft rounds seen this request
+        double f_acc_ema = 0.0;
+        int    n_rounds  = 0;
+
+        // adaptive draft length: grows when drafts are accepted, shrinks when they are not.
+        // long drafts are nearly free when the model repeats the context, but a rejected
+        // long draft wastes a whole verification pass, so scale it to the recent hit rate.
+        int n_max_cur = 0; // 0 = not initialized yet
+
+        // stop drafting for the rest of the request after a run of bad drafts -
+        // otherwise a workload the n-grams do not fit pays the verification cost all the way
+        bool muted = false;
     };
 
     std::vector<seq_info> sinfos;
@@ -1916,6 +1926,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
+        sinfo.f_acc_ema = 0.0;
+        sinfo.n_rounds  = 0;
+        sinfo.muted     = false;
 
         const size_t n = mod.get_n();
         if (prompt.size() < n) {
@@ -1965,16 +1978,27 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             sinfo.i_last = cur_len - n;
         }
 
-        result.resize(n + params.n_max);
+        if (sinfo.muted) {
+            return;
+        }
+
+        if (sinfo.n_max_cur == 0) {
+            // start short: a long draft that gets rejected costs a full verification pass
+            sinfo.n_max_cur = std::min<int>(16, params.n_max);
+        }
+        const int n_max_cur = sinfo.n_max_cur;
+        const int n_min_cur = std::min<int>(params.n_min, n_max_cur);
+
+        result.resize(n + n_max_cur);
         for (size_t i = 0; i < n - 1; ++i) {
             result[i] = prompt.at(cur_len - n + 1 + i);
         }
         result[n - 1] = dparams.id_last;
 
-        for (int i = 0; i < params.n_max; ++i) {
+        for (int i = 0; i < n_max_cur; ++i) {
             const llama_token token = mod.get(result.data() + i);
             if (token == common_ngram_mod::EMPTY) {
-                if (i < params.n_min) {
+                if (i < n_min_cur) {
                     result.clear();
                     return;
                 }
@@ -2020,22 +2044,39 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         auto & sinfo = sinfos[seq_id];
 
+        if (sinfo.n_max_cur == 0) {
+            sinfo.n_max_cur = std::min<int>(16, params.n_max);
+        }
+
         // compute acceptance fraction if we have a recorded draft length
         if (sinfo.n_draft_last > 0) {
             const double f_acc = (double)n_accepted / (double)sinfo.n_draft_last;
-            if (f_acc < 0.25) {
-                sinfo.n_low++;
-                if (sinfo.n_low >= 5) {
-                    if (verbose) {
-                        SPC_TRC("low acceptance streak (%d) - resetting ngram_mod\n", sinfo.n_low);
-                    }
 
-                    mod.reset();
-                    sinfo.n_low = 0;
-                    sinfo.i_last = 0;
+            // smooth over rounds: a single long draft that mostly misses is not evidence
+            // that the whole request is a bad fit
+            sinfo.f_acc_ema = sinfo.n_rounds == 0 ? f_acc : 0.7 * sinfo.f_acc_ema + 0.3 * f_acc;
+            sinfo.n_rounds++;
+
+            // adapt the draft length to the smoothed hit rate
+            if (sinfo.f_acc_ema >= 0.75) {
+                sinfo.n_max_cur = std::min<int>(sinfo.n_max_cur * 2, params.n_max);
+            } else if (sinfo.f_acc_ema < 0.50) {
+                sinfo.n_max_cur = std::max<int>(sinfo.n_max_cur / 2, 8);
+            }
+
+            // a request whose drafts keep missing pays the verification cost without
+            // getting tokens back - stop drafting instead of dragging the whole answer
+            if (sinfo.n_rounds >= 3 && sinfo.f_acc_ema < 0.35 && !sinfo.muted) {
+                sinfo.muted = true;
+                if (verbose) {
+                    SPC_TRC("low acceptance (ema %.2f) - stop drafting for this request\n", sinfo.f_acc_ema);
                 }
-            } else {
-                sinfo.n_low = 0;
+            }
+
+            // the ngram store keeps growing across requests; drop it when it stops fitting
+            if (sinfo.f_acc_ema < 0.25 && sinfo.n_rounds % 5 == 0) {
+                mod.reset();
+                sinfo.i_last = 0;
             }
         }
     }

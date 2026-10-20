@@ -1020,7 +1020,17 @@ private:
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-        const bool has_spec = has_draft || spec_mtp;
+        // n-gram speculators draft from the context itself and need no draft model or extra context
+        const bool spec_ngram = std::any_of(params_base.speculative.types.begin(),
+                                            params_base.speculative.types.end(),
+                                            [](common_speculative_type t) {
+                                                return t == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE ||
+                                                       t == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K ||
+                                                       t == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V ||
+                                                       t == COMMON_SPECULATIVE_TYPE_NGRAM_MOD ||
+                                                       t == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
+                                            });
+        const bool has_spec = has_draft || spec_mtp || spec_ngram;
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1138,7 +1148,7 @@ private:
                     return false;
                 }
 
-                if (ctx_dft == nullptr) {
+                if (ctx_dft == nullptr && !spec_ngram) {
                     SRV_ERR("%s", "failed to create MTP context\n");
                     return false;
                 }
@@ -4550,6 +4560,14 @@ static json get_res_model_info(const server_context_meta & meta) {
         {"object",   "model"},
         {"created",  std::time(0)},
         {"owned_by", "llamacpp"},
+        // expose the real usable context (per-slot) under the field names that
+        // OpenAI / vLLM / OpenRouter style clients look for; without these,
+        // clients fall back to their own (often much larger) default
+        {"context_length",     meta.slot_n_ctx},
+        {"max_model_len",      meta.slot_n_ctx},
+        {"max_context",        meta.slot_n_ctx},
+        {"context_window",     meta.slot_n_ctx},
+        {"n_ctx",              meta.slot_n_ctx},
         {"meta",     {
             {"vocab_type",  meta.model_vocab_type},
             {"n_vocab",     meta.model_vocab_n_tokens},

@@ -1514,6 +1514,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         split_sum += splits[i];
         splits[i] = split_sum;
     }
+    // the memory-probing path (common_fit_params) can hand us an all-zero tensor_split when a device
+    // reports no free memory; 0/0 then makes every split point NaN and upper_bound() below returns
+    // end(), i.e. devices.at(n_devices()) -> std::out_of_range. Fall back to an even split.
+    if (!(split_sum > 0.0f)) {
+        for (size_t i = 0; i < n_devices(); ++i) {
+            splits[i] = float(i + 1)/n_devices();
+        }
+        split_sum = 1.0f;
+    }
     for (size_t i = 0; i < n_devices(); ++i) {
         splits[i] /= split_sum;
     }
@@ -1526,7 +1535,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
-        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+        const int layer_gpu = std::min((int) n_devices() - 1,
+                (int) (std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin()));
         auto * dev = devices.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};

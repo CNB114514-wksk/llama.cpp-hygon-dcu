@@ -259,6 +259,11 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // pinned host memory that the device can read/write directly (ROCm_Host / CUDA_Host)
+        auto * buft_host = ggml_backend_dev_host_buffer_type(dev);
+        if (buft_host) {
+            buft_list[ggml_backend_buft_name(buft_host)] = buft_host;
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {

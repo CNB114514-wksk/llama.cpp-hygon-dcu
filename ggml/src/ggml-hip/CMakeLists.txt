@@ -143,3 +143,9 @@ if (GGML_HIP_RCCL)
 endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+
+# Hygon DCU: the host-expert split (ggml-cuda/moe-host-split.cu) computes half of a host-resident
+# MoE layer on the CPU while the GPU kernel for the other half is in flight. That needs a
+# persistent thread pool, i.e. OpenMP.
+target_compile_options(ggml-hip PRIVATE -fopenmp)
+target_link_options   (ggml-hip PRIVATE -fopenmp)

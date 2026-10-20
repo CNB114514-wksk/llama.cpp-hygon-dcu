@@ -30,6 +30,9 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmac-gemm.cuh"
 #include "ggml-cuda/mmac-gemm-q4k.cuh"
+#include "ggml-cuda/mmac-gemm-q8q5.cuh"
+#include "ggml-cuda/moe-host-split.cuh"
+#include "ggml-quants.h"   // dequantize_row_* for the MOE_SPLIT_CHECK self-test
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmid.cuh"
@@ -1896,6 +1899,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             return;
         }
     }
+    // Hygon DCU: same MMAC route for the Q8_0 dense stack (attn_qkv / attn_gate / ssm_out /
+    // hc_* / ple_* / lm_head). Those were the bulk of prefill FLOPs still on the SIMT MMQ path.
+    if (ggml_cuda_mmac_gemm_q8_0_usable(src0, src1, dst)) {
+        if (ggml_cuda_mmac_gemm_q8_0(ctx.stream(), src1->data, src0->data, (float *) dst->data,
+                                     ne11, ne01, ne00, src0->nb[1] / ggml_type_size(src0->type))) {
+            return;
+        }
+    }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
@@ -1939,6 +1950,288 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Diagnostic hooks (opt-in, measurement only -- no effect when the env vars are unset)
+// ---------------------------------------------------------------------------------------------
+
+// GGML_CUDA_HOST_CHECK=1: sample host-resident tensors on every MUL_MAT_ID and report any
+// in-place change. Tests whether a long prefill corrupts the directly-mapped weights.
+static void ggml_cuda_host_check(const ggml_tensor * t) {
+    if (!t || !t->buffer || !ggml_backend_buft_is_cuda_host(t->buffer->buft)) {
+        return;
+    }
+    static std::map<const void *, uint64_t> ref;
+    const size_t n = ggml_nbytes(t);
+    constexpr int NCHUNK = 2048, CH = 64;
+    uint64_t h = 1469598103934665603ull;
+    const unsigned char * base = (const unsigned char *) t->data;
+    for (int i = 0; i < NCHUNK; ++i) {
+        const size_t off = n > CH ? (n - CH) * (uint64_t) i / (NCHUNK - 1) : 0;
+        for (int j = 0; j < CH; ++j) { h ^= base[off + j]; h *= 1099511628211ull; }
+    }
+    auto it = ref.find(t->data);
+    if (it == ref.end()) {
+        ref[t->data] = h;
+        GGML_LOG_INFO("HOST_CHECK: %s first=0x%016llx\n", t->name, (unsigned long long) h);
+    } else if (it->second != h) {
+        GGML_LOG_ERROR("HOST_CHECK: %s MODIFIED 0x%016llx -> 0x%016llx\n", t->name,
+                       (unsigned long long) it->second, (unsigned long long) h);
+        it->second = h;
+    }
+}
+
+// GGML_CUDA_EXPERT_HIST=1: accumulate the expert routing histogram and print the coverage curve
+// periodically (kill -9 would skip atexit). Decides whether an expert-granular VRAM cache can
+// beat the layer split.
+static void ggml_cuda_expert_hist_print(const std::vector<int64_t> & hist) {
+    std::vector<int64_t> s = hist;
+    std::sort(s.begin(), s.end(), std::greater<int64_t>());
+    int64_t tot = 0; for (auto v : s) tot += v;
+    int distinct = 0; for (auto v : hist) if (v) distinct++;
+    fprintf(stderr, "EXPERT_HIST: total %lld distinct %d |", (long long) tot, distinct);
+    for (int h : {8, 16, 32, 64, 128, 256, 384}) {
+        int64_t acc = 0;
+        for (int j = 0; j < h && j < (int) s.size(); ++j) acc += s[j];
+        fprintf(stderr, " top%d=%.1f%%", h, tot ? 100.0 * acc / tot : 0.0);
+    }
+    fprintf(stderr, "\n");
+}
+
+// Per-tensor (per-layer) histograms, so we can tell whether the hot set is shared across layers
+// (a per-layer cache is then cheap) or layer-specific (the aggregate looks skewed only by luck).
+static std::map<const void *, std::vector<int64_t>> g_layer_hist;
+
+static void ggml_cuda_expert_hist(const ggml_tensor * src0, const ggml_tensor * ids, cudaStream_t stream) {
+    static std::vector<int64_t> hist(512, 0);
+    static int64_t calls = 0;
+    static bool registered = false;
+    if (!registered) {
+        registered = true;
+        std::atexit([]() {
+            ggml_cuda_expert_hist_print(hist);
+            int shown = 0;
+            for (auto & kv : g_layer_hist) {
+                shown++;
+                const std::vector<int64_t> & h = kv.second;
+                std::vector<std::pair<int64_t,int>> v;
+                int64_t tot = 0;
+                for (int i = 0; i < (int) h.size(); ++i) { v.push_back({h[i], i}); tot += h[i]; }
+                std::sort(v.begin(), v.end(), std::greater<std::pair<int64_t,int>>());
+                int64_t a[4] = {0,0,0,0}; const int hh[4] = {16,32,64,128};
+                for (int k = 0; k < 4; ++k)
+                    for (int i = 0; i < hh[k] && i < (int) v.size(); ++i) a[k] += v[i].first;
+                fprintf(stderr, "LAYER_HIST %d tot=%lld t16=%.1f t32=%.1f t64=%.1f t128=%.1f |",
+                        shown - 1, (long long) tot,
+                        tot ? 100.0*a[0]/tot : 0, tot ? 100.0*a[1]/tot : 0,
+                        tot ? 100.0*a[2]/tot : 0, tot ? 100.0*a[3]/tot : 0);
+                for (int i = 0; i < 8 && i < (int) v.size(); ++i) fprintf(stderr, " %d", v[i].second);
+                fprintf(stderr, "\n");
+            }
+        });
+    }
+    const int64_t n_used = ids->ne[0];
+    const int64_t n_tok  = ids->ne[1];
+    const int64_t n_exp  = src0->ne[2];
+    if ((int64_t) hist.size() < n_exp) hist.resize(n_exp, 0);
+    std::vector<int64_t> & lh = g_layer_hist[src0->data];
+    if ((int64_t) lh.size() < n_exp) lh.resize(n_exp, 0);
+    std::vector<int32_t> h((size_t) (n_used * n_tok));
+    CUDA_CHECK(cudaMemcpyAsync(h.data(), ids->data, h.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const int si1 = ids->nb[1] / sizeof(int32_t);
+    for (int64_t t = 0; t < n_tok; ++t) {
+        for (int64_t e = 0; e < n_used; ++e) {
+            const int32_t x = h[(size_t) (t * si1 + e)];
+            if (x >= 0 && x < n_exp) { hist[x]++; lh[x]++; }
+        }
+    }
+    if (++calls % 400 == 0) {
+        ggml_cuda_expert_hist_print(hist);
+    }
+}
+
+// Hygon DCU: split a host-resident expert layer between the PCIe path (GPU) and the CPU.
+//
+// With GGML_CUDA_HOST_DIRECT the expert weights of the last -ncmoe layers stay in host memory and
+// the GPU reads them in place. Measured at decode on K100_AI: 1.32 ms per host layer, i.e. the
+// PCIe link is saturated (15.4 GB/s of a 3.0 x16 link). Running the same layer on the CPU costs
+// 1.27 ms (16 GB/s of DRAM streaming over the 8 pinned cores). The two resources are independent,
+// so giving each side half of the expert slots and running them concurrently halves the cost.
+//
+// The CPU half is computed into pinned memory while the GPU kernel for the other half is in
+// flight, then copied back on the same stream. The rows owned by the CPU are computed by the GPU
+// kernel too (with duplicated ids), which costs a few extra rows of compute but no extra weight
+// traffic; the copy-back is queued after the kernel, so it overwrites them in order.
+static int ggml_cuda_moe_split_slots() {
+    static const int slots = [] {
+        const char * s = getenv("GGML_CUDA_MOE_SPLIT");
+        return s ? atoi(s) : 0;
+    }();
+    return slots;
+}
+
+static int ggml_cuda_moe_split_threads() {
+    static const int n = [] {
+        const char * s = getenv("GGML_CUDA_MOE_SPLIT_THREADS");
+        return s ? atoi(s) : 8;
+    }();
+    return n;
+}
+
+static bool ggml_cuda_moe_host_split(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                     const ggml_tensor * src1, const ggml_tensor * ids,
+                                     ggml_tensor * dst, int n_cpu) {
+    if (!getenv("GGML_CUDA_HOST_DIRECT")) {
+        return false;   // without it the scheduler never routes these layers through the device
+    }
+    if (!src0->buffer || !ggml_backend_buffer_is_host(src0->buffer)) {
+        return false;   // device-resident experts: nothing to overlap
+    }
+    const int64_t n_used = ids->ne[0];
+    if (src1->ne[2] != 1 || ids->ne[1] != 1 || n_used < 2) {
+        return false;   // decode only: a verify batch would swamp both paths
+    }
+    if (n_cpu >= n_used) {
+        n_cpu = (int) n_used - 1;
+    }
+    if (n_cpu < 1) {
+        return false;
+    }
+
+    const int64_t K = src0->ne[0];
+    const int64_t M = src0->ne[1];
+    if (!ggml_cuda_moe_host_split_supported(src0->type, K) || dst->nb[1] != M*(int64_t) sizeof(float)) {
+        return false;
+    }
+
+    const int64_t iex0 = n_used - n_cpu;
+    cudaStream_t  stream = ctx.stream();
+
+    // src1 is [K, ne1, n_tok] where ne1 is 1 for the gate/up projections (all expert slots share
+    // the same activation, ggml_mul_mat_id allows ids->ne[0] % b->ne[1] == 0) and n_used for the
+    // down projection (one activation row per slot).
+    const bool    act_bcast  = src1->ne[1] == 1;
+    const int64_t act_row0   = act_bcast ? 0 : iex0;
+    const int64_t act_stride = act_bcast ? 0 : src1->nb[1]/sizeof(float);
+    const size_t  act_bytes  = act_bcast ? (size_t) src1->nb[1] : (size_t) n_cpu*src1->nb[1];
+
+    static int32_t * ids_h   = nullptr;
+    static int32_t * ids_d   = nullptr;
+    static int32_t * patch_h = nullptr;
+    static float   * act_h   = nullptr;
+    static float   * out_h   = nullptr;
+    static size_t    cap_ids = 0, cap_act = 0, cap_out = 0;
+
+    if (cap_ids < (size_t) n_used) {
+        if (ids_h) {
+            CUDA_CHECK(cudaFreeHost(ids_h));
+            CUDA_CHECK(cudaFree(ids_d));
+            CUDA_CHECK(cudaFreeHost(patch_h));
+        }
+        CUDA_CHECK(cudaMallocHost((void **) &ids_h,   n_used*sizeof(int32_t)));
+        CUDA_CHECK(cudaMallocHost((void **) &patch_h, n_used*sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc    ((void **) &ids_d,   n_used*sizeof(int32_t)));
+        cap_ids = n_used;
+    }
+    if (cap_act < act_bytes) {
+        if (act_h) {
+            CUDA_CHECK(cudaFreeHost(act_h));
+        }
+        CUDA_CHECK(cudaMallocHost((void **) &act_h, act_bytes));
+        cap_act = act_bytes;
+    }
+    const size_t out_bytes = (size_t) n_cpu*M*sizeof(float);
+    if (cap_out < out_bytes) {
+        if (out_h) {
+            CUDA_CHECK(cudaFreeHost(out_h));
+        }
+        CUDA_CHECK(cudaMallocHost((void **) &out_h, out_bytes));
+        cap_out = out_bytes;
+    }
+
+    // The activation rows and the ids must be on the host before anything is enqueued, so this
+    // sync only waits for the ops that produce them.
+    static const bool prof = getenv("GGML_CUDA_MOE_PROF") != nullptr;
+    static double prof_d2h = 0, prof_cpu = 0, prof_all = 0;
+    static int    prof_n   = 0;
+    const int64_t t_enter  = ggml_time_us();
+
+    CUDA_CHECK(cudaMemcpyAsync(ids_h, ids->data, n_used*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(act_h, (const char *) src1->data + act_row0*src1->nb[1], act_bytes,
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // GGML_CUDA_MOE_SPLIT_CHECK: let the GPU compute every slot and compare the CPU result
+    // against it, to separate "CPU math is wrong" from "the split plumbing is wrong".
+    static const bool check = getenv("GGML_CUDA_MOE_SPLIT_CHECK") != nullptr;
+    for (int64_t i = 0; i < n_used; ++i) {
+        patch_h[i] = (check || i < iex0) ? ids_h[i] : ids_h[iex0 - 1];
+    }
+    CUDA_CHECK(cudaMemcpyAsync(ids_d, patch_h, n_used*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+    const int64_t t_launch = ggml_time_us();
+
+    ggml_tensor ids_gpu = *ids;
+    ids_gpu.data = ids_d;
+    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, &ids_gpu, dst);
+
+    if (prof && prof_n == 0) {
+        fprintf(stderr, "MOE_SPLIT_FIRST type=%d K=%lld M=%lld n_cpu=%d n_used=%lld bcast=%d threads=%d\n",
+                (int) src0->type, (long long) K, (long long) M, n_cpu, (long long) n_used,
+                (int) act_bcast, ggml_cuda_moe_split_threads());
+    }
+    ggml_cuda_moe_host_split_rows(src0->type,
+            (const char *) src0->data, src0->nb[1], src0->nb[2],
+            act_h, act_stride, K,
+            ids_h + iex0, n_cpu, M, out_h, ggml_cuda_moe_split_threads());
+
+    const int64_t t_cpu = ggml_time_us();
+
+    if (check) {
+        static std::vector<float> gpu_ref;
+        gpu_ref.resize((size_t) n_cpu*M);
+        CUDA_CHECK(cudaMemcpyAsync(gpu_ref.data(), (const char *) dst->data + iex0*dst->nb[1],
+                                   out_bytes, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        double max_abs = 0.0, max_rel = 0.0;
+        for (size_t i = 0; i < gpu_ref.size(); ++i) {
+            const double d = std::fabs((double) out_h[i] - (double) gpu_ref[i]);
+            max_abs = std::max(max_abs, d);
+            max_rel = std::max(max_rel, d/(1e-6 + std::fabs((double) gpu_ref[i])));
+        }
+        // scalar reference for element 0: dequantize the row and dot it in f64
+        static std::vector<float> wref;
+        wref.resize((size_t) K);
+        const char * w0 = (const char *) src0->data + (int64_t) ids_h[iex0]*src0->nb[2];
+        if (src0->type == GGML_TYPE_Q5_1) {
+            dequantize_row_q5_1((const block_q5_1 *) w0, wref.data(), K);
+        } else {
+            dequantize_row_q4_K((const block_q4_K *) w0, wref.data(), K);
+        }
+        double sref = 0.0;
+        for (int64_t i = 0; i < K; ++i) {
+            sref += (double) wref[i] * (double) act_h[i];   // activation of the first CPU slot
+        }
+        fprintf(stderr, "MOE_SPLIT_CHECK K=%lld M=%lld max_abs %.3e max_rel %.3e  cpu0=%.6g gpu0=%.6g ref0=%.6g\n",
+                (long long) K, (long long) M, max_abs, max_rel, out_h[0], gpu_ref[0], sref);
+        return true;   // keep the GPU result
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + iex0*dst->nb[1], out_h, out_bytes,
+                               cudaMemcpyHostToDevice, stream));
+
+    if (prof) {
+        prof_d2h += (double) (t_launch - t_enter);
+        prof_cpu += (double) (t_cpu    - t_launch);
+        prof_all += (double) (ggml_time_us() - t_enter);
+        if (++prof_n % 300 == 0) {
+            fprintf(stderr, "MOE_SPLIT_PROF n=%d  d2h+sync %.3f ms  cpu %.3f ms  wall %.3f ms (per call)\n",
+                    prof_n, prof_d2h/prof_n/1000.0, prof_cpu/prof_n/1000.0, prof_all/prof_n/1000.0);
+        }
+    }
+    return true;
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -1947,6 +2240,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
+    if (getenv("GGML_CUDA_HOST_CHECK")) {
+        ggml_cuda_host_check(src0);
+    }
+    if (getenv("GGML_CUDA_EXPERT_HIST")) {
+        ggml_cuda_expert_hist(src0, ids, ctx.stream());
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -1954,10 +2254,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+        // GGML_CUDA_MMID_FORCE_MMQ: skip the vec kernel and let the mat-mat quant path handle
+        // the decode batch. The vec kernel runs one warp per (row-pair, expert) and is latency
+        // bound at batch 1; MMQ tiles over K and may keep far more loads in flight.
+        const bool mmid_skip_mmvq = getenv("GGML_CUDA_MMID_FORCE_MMQ") != nullptr;
+        if (!mmid_skip_mmvq && ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
+                    const int n_split = ggml_cuda_moe_split_slots();
+                    if (n_split > 0 && ggml_cuda_moe_host_split(ctx, src0, src1, ids, dst, n_split)) {
+                        return;
+                    }
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -1996,6 +2304,34 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 return;
             }
             // kernel refused (e.g. probe unavailable): fall through, MMQ re-runs the ids helper
+        }
+
+        // Hygon DCU: grouped MMAC for the Q5_1 expert down-projection. Every ffn_down_exps in
+        // this model is Q5_1, so the Q4_K path above never covered it.
+        if (ggml_cuda_mmac_gemm_q5_1_id_usable(src0, src1, ids, dst)) {
+            const int64_t n_expert_used_q51 = ids->ne[0];
+            const int64_t ne_get_rows_q51   = ne12 * n_expert_used_q51;
+
+            ggml_cuda_pool_alloc<int32_t> ids_src1_q51(ctx.pool(), ne_get_rows_q51);
+            ggml_cuda_pool_alloc<int32_t> ids_dst_q51 (ctx.pool(), ne_get_rows_q51);
+            ggml_cuda_pool_alloc<int32_t> expert_bounds_q51(ctx.pool(), ne02 + 1);
+
+            const int si1_q51  = ids->nb[1] / ggml_element_size(ids);
+            const int sis1_q51 = nb12 / nb11;
+
+            ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1_q51.get(), ids_dst_q51.get(),
+                expert_bounds_q51.get(), ne02, ne12, n_expert_used_q51, ne11, si1_q51, sis1_q51,
+                /*write_inverse=*/false, ctx.stream());
+            CUDA_CHECK(cudaGetLastError());
+
+            if (ggml_cuda_mmac_gemm_q5_1_id(ctx.stream(), src1->data, src0->data, (float *) dst->data,
+                        ids_src1_q51.get(), ids_dst_q51.get(), expert_bounds_q51.get(),
+                        ne02, ne_get_rows_q51, ne01, ne00,
+                        src1->nb[1] / sizeof(float),
+                        src0->nb[1] / ggml_type_size(src0->type),
+                        src0->nb[2] / ggml_type_size(src0->type))) {
+                return;
+            }
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
@@ -5583,7 +5919,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    // GGML_CUDA_HOST_DIRECT: let the device read/write pinned host tensors in place instead of
+    // staging a copy through VRAM. On discrete cards this trades a memcpy for direct PCIe reads,
+    // which pays off when the op is bandwidth-bound and the weights would not fit in VRAM anyway.
+    const bool host_direct = !integrated && getenv("GGML_CUDA_HOST_DIRECT") != nullptr;
+    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) ||
+           ((integrated || host_direct) && ggml_backend_buft_is_cuda_host(buft));
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
